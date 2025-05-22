@@ -57,10 +57,24 @@
             flex: 1;
             text-align: center;
         }
+
+        .loading-indicator {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            background: rgba(255, 255, 255, 0.9);
+            padding: 20px;
+            border-radius: 10px;
+            box-shadow: 0 0 10px rgba(0,0,0,0.3);
+            display: none;
+            z-index: 1000;
+        }
     </style>
 </head>
 <body>
     <div id="map"></div>
+    <div id="loading" class="loading-indicator">Loading data...</div>
 
     <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
     <script>
@@ -72,16 +86,24 @@
 function getColor(value) {
     if (isNaN(value)) {
         return '#FFFFFF';
-    } else if (value > 0.0 && value < 1) {
-        // Green gradient between 0.0 and 1
-        return 'rgb(' + Math.floor((value / 0.8) * 255) + ',255,0)';
-    } else if (value >= 1.0 && value <= 2.5) {
-        // Red gradient from 1.0 to 3
-        return 'rgb(255,' + Math.floor((1 - (value - 1) / 1.5) * 255) + ',0)';
-    } else {
-        // For values outside the range, return red
-        return 'rgb(255,0,0)';
     }
+    
+    // Pre-calculate color values for better performance
+    const maxGreen = 255;
+    const maxRed = 255;
+    
+    if (value > 0.0 && value < 1) {
+        // Green gradient between 0.0 and 1
+        const green = Math.floor((value / 0.8) * maxGreen);
+        return `rgb(${green},${maxGreen},0)`;
+    } else if (value >= 1.0 && value <= 2.5) {
+        // Red gradient from 1.0 to 2.5
+        const green = Math.floor((1 - (value - 1) / 1.5) * maxGreen);
+        return `rgb(${maxRed},${green},0)`;
+    }
+    
+    // For values outside the range, return red
+    return `rgb(${maxRed},0,0)`;
 }
         var map = L.map('map').setView([43.072, -89.4], 16);
 
@@ -89,49 +111,161 @@ function getColor(value) {
             attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
         }).addTo(map);
 
-        // Load GeoJSON data from local file
-        fetch("./output.geojson")
-            .then(response => response.json())
-            .then(data => {
-                // Add GeoJSON layer to map
-                var geojsonLayer = L.geoJSON(data, {
-                    style: function(feature) {
-                        return {
-                            fillColor: getColor((feature.properties.CurrentLand * 0.08229848723438737) / feature.properties.TotalTaxes),
-                            color: "none", // Change outline color here
-                            fillOpacity: 0.5
-                        };
-                    },
-                    onEachFeature: function(feature, layer) {
-                        layer.on('mouseover', function (e) {
-                            var popupContent = "<b>Address:</b> " + feature.properties.Address 
-                            + "<br><b>Property Taxes:</b> "+ USDollar.format(feature.properties.TotalTaxes) 
-                            + "<br><b>Land Value Taxes:</b> " + USDollar.format(feature.properties.CurrentLand * 0.08229848723438737)
-                            +"<br><b>Percent of Property Taxes:</b> "+ (100*(feature.properties.CurrentLand * 0.08229848723438737) / feature.properties.TotalTaxes).toFixed(2)+"%"
-                            +"<br><b>Property Use:</b> "+feature.properties.PropertyUse;
-                            layer.bindPopup(popupContent).openPopup();
+        // Cache for loaded data
+        const loadedData = new Map();
+        const taxRate = 0.08229848723438737;
+        let currentLayer = null;
+
+        function processFeature(feature) {
+            const landValue = feature.properties.CurrentLand * taxRate;
+            feature.properties.calculatedLandValue = landValue;
+            feature.properties.percentageOfTax = (100 * landValue / feature.properties.TotalTaxes).toFixed(2);
+            return feature;
+        }
+
+        function createGeoJSONLayer(features) {
+            return L.geoJSON(features, {
+                style: function(feature) {
+                    return {
+                        fillColor: getColor(feature.properties.calculatedLandValue / feature.properties.TotalTaxes),
+                        color: "none",
+                        fillOpacity: 0.5,
+                        weight: 1
+                    };
+                },
+                onEachFeature: function(feature, layer) {
+                    const popupContent = `<b>Address:</b> ${feature.properties.Address}
+                        <br><b>Property Taxes:</b> ${USDollar.format(feature.properties.TotalTaxes)}
+                        <br><b>Land Value Taxes:</b> ${USDollar.format(feature.properties.calculatedLandValue)}
+                        <br><b>Percent of Property Taxes:</b> ${feature.properties.percentageOfTax}%
+                        <br><b>Property Use:</b> ${feature.properties.PropertyUse}`;
+                    
+                    layer.bindPopup(popupContent);
+                    
+                    // Add hover effects
+                    layer.on('mouseover', function(e) {
+                        const layer = e.target;
+                        layer.setStyle({
+                            fillOpacity: 0.8,
+                            weight: 2,
+                            color: '#666'
                         });
-                        layer.on('mouseout', function (e) {
-                            layer.closePopup();
+                        layer.openPopup();
+                    });
+
+                    layer.on('mouseout', function(e) {
+                        const layer = e.target;
+                        layer.setStyle({
+                            fillOpacity: 0.5,
+                            weight: 1,
+                            color: 'none'
+                        });
+                        layer.closePopup();
+                    });
+                }
+            });
+        }
+
+        function loadDataForBounds(bounds) {
+            const loadingIndicator = document.getElementById('loading');
+            loadingIndicator.style.display = 'block';
+
+            console.log('Loading data for bounds:', bounds);
+            
+            fetch("./output.geojson")
+                .then(response => {
+                    if (!response.ok) {
+                        throw new Error(`HTTP error! status: ${response.status}`);
+                    }
+                    console.log('GeoJSON response received');
+                    return response.json();
+                })
+                .then(data => {
+                    console.log('GeoJSON data parsed, features:', data.features.length);
+                    
+                    // Filter features that are within the current bounds
+                    const features = data.features.filter(feature => {
+                        if (!feature.geometry || !feature.geometry.coordinates) {
+                            console.warn('Invalid feature geometry:', feature);
+                            return false;
+                        }
+
+                        // Handle both Polygon and MultiPolygon geometries
+                        let coordinates;
+                        if (feature.geometry.type === 'Polygon') {
+                            coordinates = feature.geometry.coordinates[0];
+                        } else if (feature.geometry.type === 'MultiPolygon') {
+                            coordinates = feature.geometry.coordinates[0][0];
+                        } else {
+                            console.warn('Unsupported geometry type:', feature.geometry.type);
+                            return false;
+                        }
+
+                        // Check if any point of the polygon is within bounds
+                        return coordinates.some(coord => {
+                            const lat = coord[1];
+                            const lng = coord[0];
+                            const isInBounds = bounds.contains([lat, lng]);
+                            return isInBounds;
+                        });
+                    }).map(processFeature);
+                    
+                    console.log('Filtered features:', features.length);
+                    if (features.length === 0) {
+                        console.log('No features found in bounds. Current bounds:', {
+                            north: bounds.getNorth(),
+                            south: bounds.getSouth(),
+                            east: bounds.getEast(),
+                            west: bounds.getWest()
                         });
                     }
-                }).addTo(map);
-                // Add legend
-                var legend = L.control({ position: 'bottomright' });
 
-                legend.onAdd = function (map) {
-                    var div = L.DomUtil.create('div', 'legend');
-                    div.innerHTML += '<div class="legend-title">Percentage of Property Tax</div>';
-                    div.innerHTML += '<div class="legend-gradient"></div>';
-                    div.innerHTML += '<div class="legend-labels"><span class="legend-label">0%</span><span class="legend-label">100%</span><span class="legend-label">250%+</span></div>';
-                    return div;
-                };
+                    // Remove existing layer if it exists
+                    if (currentLayer) {
+                        map.removeLayer(currentLayer);
+                    }
 
-                legend.addTo(map);
-            })
-            .catch(error => {
-                console.error('Error loading GeoJSON:', error);
-            });
+                    // Create and add new layer
+                    currentLayer = createGeoJSONLayer(features);
+                    currentLayer.addTo(map);
+                    loadingIndicator.style.display = 'none';
+                })
+                .catch(error => {
+                    console.error('Error loading GeoJSON:', error);
+                    loadingIndicator.style.display = 'none';
+                    alert('Error loading map data. Please check console for details.');
+                });
+        }
+
+        // Add legend
+        var legend = L.control({ position: 'bottomright' });
+        legend.onAdd = function (map) {
+            var div = L.DomUtil.create('div', 'legend');
+            div.innerHTML += '<div class="legend-title">Percentage of Property Tax</div>';
+            div.innerHTML += '<div class="legend-gradient"></div>';
+            div.innerHTML += '<div class="legend-labels"><span class="legend-label">0%</span><span class="legend-label">100%</span><span class="legend-label">250%+</span></div>';
+            return div;
+        };
+        legend.addTo(map);
+
+        // Load initial data after a short delay to ensure map is ready
+        setTimeout(() => {
+            console.log('Loading initial data...');
+            // Expand the initial bounds to ensure we get some data
+            const initialBounds = map.getBounds().pad(0.5);
+            loadDataForBounds(initialBounds);
+        }, 100);
+
+        // Reload data when map moves
+        let moveTimeout;
+        map.on('moveend', function() {
+            clearTimeout(moveTimeout);
+            moveTimeout = setTimeout(() => {
+                // Expand the bounds slightly to ensure we get data at the edges
+                const expandedBounds = map.getBounds().pad(0.1);
+                loadDataForBounds(expandedBounds);
+            }, 250); // Debounce the moveend event
+        });
     </script>
 </body>
 </html>
